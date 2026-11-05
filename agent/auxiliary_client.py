@@ -122,7 +122,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import FAILURE_REASON_BILLING, load_pool
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent import auxiliary_plugin_oauth as _plugin_oauth
 from agent.message_metadata import data_use_requirement
@@ -3637,13 +3637,13 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
         return False
     status_code = getattr(exc, "status_code", None)
 
-    def _rotate(fallback_status: int) -> bool:
+    def _rotate(fallback_status: int, failure_reason: Optional[str] = None) -> bool:
         error_context: dict[str, Any] = {"message": str(exc)}
         if status_code is not None:
             error_context["status_code"] = status_code
         next_entry = pool.mark_exhausted_and_rotate(
             status_code=status_code if status_code is not None else fallback_status,
-            error_context=error_context, api_key_hint=failed_api_key or None,
+            error_context=error_context, api_key_hint=failed_api_key or None, failure_reason=failure_reason,
         )
         if next_entry is None:
             return False
@@ -3655,8 +3655,8 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
             _evict_cached_clients(normalized)
             return True
         return _rotate(401)
-    if _is_payment_error(exc):
-        return _rotate(402)
+    if _is_payment_error(exc):  # a 403/429 spending limit is billing too: account-wide, never "sign in again"
+        return _rotate(402, FAILURE_REASON_BILLING)
     if _is_rate_limit_error(exc) and not _is_overloaded_error(exc):
         return _rotate(429)
     return False
@@ -4513,7 +4513,7 @@ def _try_main_provider_route(
             explicit_api_key = runtime_api_key
     elif runtime_api_key:
         # Pin the session's working key over a re-selected pool key, unless its plugin OAuth pool knows it is dead.
-        explicit_api_key = None if _plugin_oauth.pool_superseded_key(main_provider, runtime_api_key) else runtime_api_key
+        explicit_api_key = None if _plugin_oauth.pool_superseded_key(main_provider, runtime_api_key, runtime_base_url) else runtime_api_key
     # Skip if the main provider was recently 402'd (unhealthy TTL bounds the bypass).
     main_chain_label = _normalize_chain_label(resolved_provider)
     if main_chain_label and _is_provider_unhealthy(main_chain_label, health_base_url):
@@ -7641,8 +7641,7 @@ def _ladder_credential_rungs(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
     if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
             and not client_is_nous):
-        failed_key = getattr(client, "api_key", "")
-        if _refresh_provider_credentials(auth_refresh_provider, failed_api_key=failed_key if isinstance(failed_key, str) else ""):
+        if _refresh_provider_credentials(auth_refresh_provider, failed_api_key=_plugin_oauth.sent_api_key(first_err, client)):
             if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                 # The stale client is cached under the route label (e.g. "auto"), not the backend.
                 _evict_cached_clients(resolved_provider)
@@ -7654,15 +7653,12 @@ def _ladder_credential_rungs(
                 step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
             if first_err is None:
                 return resp, None
-            _plugin_oauth.bench_pooled_row(auth_refresh_provider, first_err)  # no-op unless a 401
             # ``first_err`` is now the retry's own failure, not the original auth error: the
             # pool gate below and the ladder tail's eviction check both read this narrowed
             # value. An unclaimed failure (e.g. a 500) re-raised out of ``_rung`` above
             # instead, since the provider-fallback rung only acts on ``_FALLBACK_REASONS``.
-    pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
-    # Capture the exact key used so recovery finds the right pool entry even if another
-    # process rotated the pool meanwhile (current() would be None).
-    _client_api_key = str(getattr(client, "api_key", "") or "")
+    pool_provider = (_recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
+                     or _plugin_oauth.shared_host_pool(resolved_provider, auth_refresh_provider))
     # Gate on the narrowed error: a connection failure from the retry above arrives here
     # unaccepted on purpose (a fresh key cannot fix an unreachable endpoint), so rotation
     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
@@ -7674,7 +7670,8 @@ def _ladder_credential_rungs(
             resp, recovery_err = yield from rate_limit_retry_rungs(first_err, client, kwargs, f"{task or 'call'}{tag}")
             if recovery_err is None:
                 return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+        # Name the bearer that request sent (a refresh retry's stamp; else the first client, which the backoff reuses).
+        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_plugin_oauth.sent_api_key(recovery_err, client)):
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
                         task or "call", tag, pool_provider, type(recovery_err).__name__)
             try:
@@ -7685,7 +7682,7 @@ def _ladder_credential_rungs(
                 # then fall through to the provider fallback.
                 if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                         or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
+                    _recover_provider_pool(pool_provider, retry2_err, failed_api_key=_plugin_oauth.sent_api_key(retry2_err))
                     first_err = retry2_err
                 else:
                     raise

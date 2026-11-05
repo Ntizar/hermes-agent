@@ -13,16 +13,12 @@ Real ``call_llm`` path; only Google's HTTP and the token broker are faked.
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 import time
 
 import httpx
 import pytest
 
 import agent.auxiliary_client as aux
-from tests.waiting import wait_until
 from agent.auxiliary_unavailable import pool_cooldown_message
 from hermes_cli import auth_oauth_pkce_plugin as pkce
 
@@ -265,7 +261,7 @@ def test_a_newer_token_minted_by_another_process_during_the_retry_is_not_benched
 
 def test_only_the_row_the_retry_used_is_benched(env, monkeypatch):
     """Session on row A; its refresh works, but the retry leases higher-priority row B, which is rejected.
-    B is benched; A, whose fresh token works, stays available."""
+    B is benched; A, whose fresh token works, stays available and the pool rotation serves the call on it."""
     home, _grants, seen = env
     row_a = _row("ya29.a-old", _now_ms() + 3_000_000, id="rowA", priority=1)
     row_b = {**_row("ya29.b-bad", _now_ms() + 3_000_000, id="rowB", priority=0), "refresh_token": "1//rt-b"}
@@ -274,70 +270,107 @@ def test_only_the_row_the_retry_used_is_benched(env, monkeypatch):
     runtime = {"provider": "solstice", "model": "gemini-3.1-pro", "api_key": "ya29.a-old",
                "base_url": BASE_URL, "api_mode": "chat_completions"}
 
-    try:
-        _title(runtime)
-    except Exception:
-        pass
+    assert _text(_title(runtime)) == "A Title"
 
     rows = _rows(home)
     assert rows["rowA"].get("last_status") != "exhausted"
-    assert seen[1:] == ["Bearer ya29.b-bad"]  # the retry leased B
+    assert seen[1:] == ["Bearer ya29.b-bad", "Bearer ya29.fresh-1"]  # the retry leased B, rotation moved to A
     assert rows["rowB"].get("last_status") == "exhausted"
 
 
-_PEER = """
-import json, sys, time
-from pathlib import Path
-from hermes_cli.auth import _auth_store_lock
-path, marker = sys.argv[1], Path(sys.argv[2])
-
-def refresh():
-    data = json.load(open(path, encoding="utf-8-sig"))
-    row = data["credential_pool"]["solstice"][0]
-    row.update(access_token="ya29.peer", expires_at_ms=int(time.time() * 1000) + 3_000_000)
-    for k in ("last_status", "last_status_at", "last_error_code", "last_error_reason", "last_error_message"):
-        row.pop(k, None)
-    open(path, "w", encoding="utf-8").write(json.dumps(data))
-
-try:
-    with _auth_store_lock(timeout_seconds=1):
-        refresh()
-    marker.write_text("done")
-except TimeoutError:
-    marker.write_text("blocked")
-    with _auth_store_lock():
-        refresh()
-"""
-
-
 def test_a_peer_refresh_racing_the_bench_never_inherits_its_cooldown(env, monkeypatch):
-    """Another process persists a newer token for the same row after the bench has read the pool. The
-    check and the write share the auth-store lock with that refresh, so the newer token ends up on disk
-    without the stale bearer's cooldown, whichever way the race goes."""
+    """Another process persists a newer token for the same row after the bench has read the pool. A 401
+    bench is a verdict on the bearer that was sent, so the newer token ends up on disk without it."""
+    from agent.credential_pool import CredentialPool
+
     home, _grants, _seen = env
     monkeypatch.setattr(httpx.Client, "post", lambda self, url, **kw: httpx.Response(
         401, request=httpx.Request("POST", str(url)),
         json={"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "invalid credentials"}}))
     _write(home, _row("ya29.revoked", _now_ms() + 3_000_000))
-    load = aux._load_pool_with_credentials
-    peers, marker = [], home.parent / "peer-state"
+    bench = CredentialPool.mark_exhausted_and_rotate
+    raced = []
 
-    def load_then_race(provider, *args, **kwargs):
-        pool = load(provider, *args, **kwargs)
-        if "bench" in str(args):
-            env_ = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-            peers.append(subprocess.Popen([sys.executable, "-c", _PEER, str(home / "auth.json"), str(marker)], env=env_))
-            # The peer either lands its refresh first (nothing serialises it) or reports it is blocked.
-            wait_until(lambda: marker.exists() and marker.read_text() in ("done", "blocked"), timeout=30)
-        return pool
+    def peer_refreshes_first(self, **kwargs):
+        if not raced:  # the peer lands its refresh between our read of the pool and our bench write
+            raced.append(kwargs.get("api_key_hint"))
+            _write(home, _row("ya29.peer", _now_ms() + 3_000_000))
+        return bench(self, **kwargs)
 
-    monkeypatch.setattr(aux, "_load_pool_with_credentials", load_then_race)
+    monkeypatch.setattr(CredentialPool, "mark_exhausted_and_rotate", peer_refreshes_first)
     runtime = {"provider": "solstice", "model": "gemini-3.1-pro", "base_url": BASE_URL, "api_mode": "chat_completions"}
 
     with pytest.raises(Exception):
         _title(runtime)
-    assert peers, "the bench never ran"
-    assert peers[0].wait(timeout=30) == 0
+    assert raced == ["ya29.fresh-1"], "the bench must name the bearer the refreshed retry sent"
     row = _disk_row(home)
     assert row["access_token"] == "ya29.peer"
     assert row.get("last_status") != "exhausted"
+
+
+def test_an_availability_probe_never_spends_a_refresh(env):
+    """``aux_probe_mode`` answers "is this provider resolvable?": an expired row stays as it is."""
+    home, grants, _seen = env
+    _write(home, _row("ya29.expired", _now_ms() - 1000))
+    with aux.aux_probe_mode():
+        aux._get_cached_client("solstice", "gemini-3.1-pro")
+    assert grants == []
+    assert _disk_row(home)["access_token"] == "ya29.expired"
+
+
+def test_a_backoff_retry_benches_the_bearer_it_sent_not_the_refreshed_one(env, monkeypatch):
+    """The refreshed retry hits a 429; its same-key backoff then re-sends on the first client and gets the
+    401. Recovery must bench that request's bearer: the refreshed token never failed a sign-in."""
+    from agent.credential_pool import CredentialPool
+
+    home, _grants, seen = env
+
+    def respond(self, url, **kw):
+        bearer = (kw.get("headers") or {}).get("Authorization", "")
+        seen.append(bearer)
+        req = httpx.Request("POST", str(url))
+        if "fresh" in bearer:
+            return httpx.Response(429, request=req, headers={"retry-after": "0.1"},
+                                  json={"error": {"code": 429, "status": "TOO_MANY", "message": "too many requests"}})
+        return httpx.Response(401, request=req, json={"error": {"code": 401, "status": "UNAUTHENTICATED"}})
+
+    monkeypatch.setattr(httpx.Client, "post", respond)
+    benched = []
+    bench = CredentialPool.mark_exhausted_and_rotate
+    monkeypatch.setattr(CredentialPool, "mark_exhausted_and_rotate",
+                        lambda self, **kw: benched.append(kw.get("api_key_hint")) or bench(self, **kw))
+    _write(home, _row("ya29.revoked", _now_ms() + 3_000_000))
+    runtime = {"provider": "solstice", "model": "gemini-3.1-pro", "base_url": BASE_URL, "api_mode": "chat_completions"}
+
+    with pytest.raises(Exception):
+        _title(runtime)
+    assert seen == ["Bearer ya29.revoked", "Bearer ya29.fresh-1", "Bearer ya29.revoked"]
+    assert "ya29.fresh-1" not in benched
+
+
+def test_a_proxys_own_credential_is_never_swapped_for_the_pools_bearer(env):
+    """A main route at a proxy origin, with a key the pool never issued, keeps its key: the pooled Google
+    bearer must not be sent to the proxy host."""
+    from agent.auxiliary_plugin_oauth import pool_superseded_key
+
+    home, _grants, _seen = env
+    _write(home, _row("ya29.pooled", _now_ms() + 3_000_000))
+    assert pool_superseded_key("solstice", "proxy-key", "https://proxy.example.invalid/v1alpha") is False
+    assert pool_superseded_key("solstice", "ya29.rotated-away", BASE_URL) is True
+
+
+def test_a_spending_limit_403_is_benched_as_billing_not_a_rejected_sign_in(env, monkeypatch):
+    """A 403 spending limit is account-wide: benched as billing (kept across a peer's refresh) and never
+    reported as a rejected sign-in the user should fix by signing in again."""
+    home, _grants, _seen = env
+    monkeypatch.setattr(httpx.Client, "post", lambda self, url, **kw: httpx.Response(
+        403, request=httpx.Request("POST", str(url)),
+        json={"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "This project requires billing to be enabled"}}))
+    _write(home, _row("ya29.ok", _now_ms() + 3_000_000))
+    runtime = {"provider": "solstice", "model": "gemini-3.1-pro", "base_url": BASE_URL, "api_mode": "chat_completions"}
+
+    with pytest.raises(Exception):
+        _title(runtime)
+    row = _disk_row(home)
+    assert row["last_status"] == "exhausted" and row["failure_reason"] == "billing"
+    assert "Sign in again" not in pool_cooldown_message("solstice")
